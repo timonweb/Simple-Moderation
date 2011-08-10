@@ -1,0 +1,471 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Provides a simple content moderation workflow
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function simod_menu() {
+  $items = array();
+  $items['node/%node/simod-delete'] = array(
+    'title' => 'Delete and Send Message to Author',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simod_node_form_disapprove_confirm', 1),
+    'access callback' => 'node_access',
+    'access arguments' => array('delete', 1),
+    'type' => MENU_CALLBACK,
+    'file' => 'simod.admin.inc',
+  );
+  $items['admin/config/simod'] = array(
+    'title' => 'Simple Moderation Email Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simod_admin_settings'),
+    'access arguments' => array('administer simod'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'simod.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_admin_paths().
+ */
+function simod_admin_paths() {
+  if (variable_get('node_admin_theme')) {
+    $paths = array(
+      'node/*/simod-delete' => TRUE,
+    );
+    return $paths;
+  }
+}
+
+/**
+ * Implements hook_admin_paths_alter().
+ * Here we register our 
+ */
+function simod_admin_paths_alter(&$paths) {
+  $path['node/*/simode-delete'] = TRUE;
+  $path['admin/content/approval'] = TRUE;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function simod_permission() {
+
+  $perms = array();
+  
+  $perms = array(
+    'administer simod' => array(
+      'title' => t('Administer Simple Moderation'),
+      'description' => t('User can enable and disable moderation workflow for different content types'), 
+    ),
+    'access simple moderation approval page' => array(
+      'title' => t('Access Simple Moderation Approval Page'),
+      'description' => t('User will be able to access simple moderation approval page'), 
+    ),
+  );
+  
+  // Generate skip moderation permissions for all moderation-enabled node types.
+  foreach (simod_permissions_get_configured_types() as $type) {
+    $perms += simod_list_permissions($type);
+  }
+  
+  return $perms;
+}
+
+/**
+ * Generate permission list for a given type.
+ */
+function simod_list_permissions($type) {
+  $info = node_type_get_type($type);
+  $type = check_plain($info->type);
+
+  // Build standard list of node permissions for this type.
+  $perms = array(
+    "skip $type approval" => array(
+      'title' => t('%type_name: Post without approval', array('%type_name' => $info->name)),
+    ),
+  );
+
+  return $perms;
+}
+
+/**
+ * Returns an array of node types that should be managed by permissions.
+ */
+function simod_permissions_get_configured_types() {
+
+  $configured_types = array();
+
+  foreach (node_type_get_types() as $type => $info) {
+    if (variable_get('simod_moderate_' . $type, 0) == 1) {
+      $configured_types[] = $type;
+    }
+  }
+
+  return $configured_types;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter()
+ */
+function simod_form_node_type_form_alter(&$form, $form_state) {
+  // If we dont have permission to administer the moderation then we need to abort this alter now!
+  if (!user_access('administer simod')) return;
+  
+  // Add the node-type specific page title settings to the additional settings section
+  $form['simod'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Moderation Settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#tree' => TRUE,
+    '#group' => 'additional_settings',
+  );
+  
+  $form['simod']['enable_field'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Simple Moderation Workflow'),
+    '#description' => t('If checked, the content type will become moderated, all new nodes wont be published until moderator decides to publish them'),
+    '#options' => array(
+      'enable_field' => t('Enabled'),
+    ),
+    '#default_value' => variable_get('simod_moderate_' . $form['#node_type']->type, 0) ? array('enable_field') : array(),
+  );
+  
+  $form['#submit'][] = 'simod_node_type_form_submit';
+}
+
+/**
+ * Submit handler for the node_type_form element added in the hook_form_FORM_ID_alter() above.
+ */
+function simod_node_type_form_submit($form, &$form_state) {
+  $enable_field = $form_state['values']['simod']['enable_field']['enable_field'] ? 1 : 0;
+  variable_set('simod_moderate_' . $form_state['values']['type'], $enable_field);
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function simod_node_presave($node) {
+  // Check if moderation is enabled for this node_type and if user doesn't have a permission to post without approval
+  if (!isset($node->nid) && variable_get('simod_moderate_' . $node->type, 0) == 1 && !user_access("skip $node->type approval")) {
+    // We set node status and promoted to 0
+    $node->status = 0;
+    $node->promote = 0;  
+  }
+  // Logic to determine if moderated node is approved (changed published status from 0 to 1)
+  // If we update the node which has moderation enabled and is submitted by user who doesn't have the right to skip approval
+  if (isset($node->nid) && variable_get('simod_moderate_' . $node->type, 0) == 1 && (!user_access("skip $node->type approval", user_load($node->uid)))) {
+    if ($node->status == 1) {
+      // Load previos node state to check if node is being published
+      if (node_load($node->nid)->status == 0) {
+        // We're publishing the node and we need to inform the author about this
+        drupal_set_message(t('@type !title has been approved', array('@type' => node_type_get_name($node), '!title' => $node->title)));
+        // Send email notification
+        $author = user_load($node->uid);
+        // Send message to the author
+        drupal_mail('simod', 'approved', isset($node->anonymous_author['mail']) ? $node->anonymous_author['mail'] : $author->mail, user_preferred_language($author), array('node' => $node));
+        // Send message to administrator
+        drupal_mail('simod', 'approved', _simod_admin_emails(), user_preferred_language($author), array('node' => $node));      
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function simod_form_alter(&$form, $form_state, $form_id) {
+  global $user;
+  // If we're editing a node and content type is moderated and user doesn't have a permission to skip the form approval
+  if (!empty($form['#node_edit_form']) && variable_get('simod_moderate_' . $form['type']['#value'], 0) == 1 && !user_access('skip ' . $form['type']['#value'] . ' approval')) {
+    // We add submit handler for a form redirection
+    $form['actions']['submit']['#submit'][] = 'simod_node_form_submit';
+    
+    // Add email field for an anonymous user
+    $form['simod_mail'] = array(
+      '#title' => t('E-mail'),
+      '#type' => 'textfield',
+      '#description' => t('Enter your e-mail address so we could contact you'),
+      '#required' => TRUE,
+      '#maxlength' => 64,
+      '#size' => 30,
+      '#access' => $user->uid == 0,
+      '#weight' => 10,
+    );
+    
+    // Add custom validation
+    $form['#validate'][] = 'simod_node_form_validate';
+  }
+  // If we're editing a node and content type is moderated and user can edit this content type and the node exists
+  elseif (!empty($form['#node_edit_form']) && variable_get('simod_moderate_' . $form['type']['#value'], 0) == 1 && user_access('edit any ' . $form['type']['#value'] . ' content') && !empty($form['nid']['#value'])) {
+    // Add anonymous user data
+    //if (!empty($form['#node']->anonymous_author)) {
+      //$form['terms'] = array('#value' => t('Terms and Conditions.'));
+    //}
+    // Add button with a delete function
+    $form['actions']['disapprove'] = array(
+      '#type' => 'submit',
+      '#value' => t('Delete and Send Message to Author'),
+      '#weight' => 10,
+      '#submit' => array('simode_node_form_disapprove_submit'),
+    );
+  }
+}
+
+/**
+ * Submit handler for node_edit_form above
+ */
+function simode_node_form_disapprove_submit($form, &$form_state) {
+  $destination = array();
+  if (isset($_GET['destination'])) {
+    $destination = drupal_get_destination();
+    unset($_GET['destination']);
+  }
+  $node = $form['#node'];
+  $form_state['redirect'] = array('node/' . $node->nid . '/simod-delete', array('query' => $destination));
+}
+
+/**
+ * Validation handler for the simod_form_alter element added in the hook_form_alter() above.
+ */
+function simod_node_form_validate($form, &$form_state) {
+  // Check if date input into simod_mail field is valid
+  if ($form_state['values']['simod_mail'] && !valid_email_address($form_state['values']['simod_mail'])) {
+    form_set_error('simod_mail', t('The e-mail address you specified is not valid.'));
+  }
+}
+
+/**
+ * Submit handler for the simod_form_alter element added in the hook_form_alter() above.
+ */
+function simod_node_form_submit($form, &$form_state) {
+  // Redirect form to a referer page, otherwise to a front page 
+  $form_state['redirect'] = !empty($_SERVER["HTTP_REFERER"]) ? $_SERVER["HTTP_REFERER"] : '<front>';
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function simod_node_insert($node) {
+  // Check if moderation is enabled for this node_type and if email field exists and filled
+  if (variable_get('simod_moderate_' . $node->type, 0) == 1 && !empty($node->simod_mail)) {
+    // Insert this field into a separate table
+    db_insert('simod_anonymous_submissions')
+      ->fields(array(
+        'nid' => $node->nid,
+        'mail' => $node->simod_mail,
+        'hostname' => ip_address(),
+        'created' => REQUEST_TIME,
+      ))
+      ->execute();  
+  }
+  // Check if moderation is enabled for this node_type and if user doesn't have a permission to post without approval
+  if (variable_get('simod_moderate_' . $node->type, 0) == 1 && !user_access("skip $node->type approval")) {
+    global $user;
+    
+    // Send notification email to the user
+    drupal_mail('simod', 'thankyou', isset($node->simod_mail) ? $node->simod_mail : $user->mail, user_preferred_language($user), array('node' => $node));
+    // Send notification email to the admin
+    drupal_mail('simod', 'newcontent', _simod_admin_emails(), user_preferred_language($user), array('node' => $node));
+    
+    drupal_set_message(t('Thank you, we will review your @type.', array('@type' => node_type_get_name($node))));  
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function simod_node_delete($node) {
+  // Delete anonymous author data if exists
+  db_delete('simod_anonymous_submissions')->condition('nid', $node->nid)->execute();
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function simod_node_load($nodes, $types) {
+  foreach ($nodes AS $node) {
+    if ($node->uid == 0 && $anonymous_author = simod_load_anonymous_author($node->nid)) {
+      $node->anonymous_author = $anonymous_author;
+    }
+  }
+}
+
+/**
+ * Loads anonymous author data if exists
+ */
+function simod_load_anonymous_author($nid) {
+  return db_query_range("SELECT * FROM {simod_anonymous_submissions} WHERE nid = :nid", 0, 1, array(':nid' => $nid))->fetchAssoc();
+}
+
+/**
+ * Alter administratiion view to limit content_types to those which have moderation mode enabled
+ */
+function simod_views_query_alter($view, &$query) {
+  if ($view->name == 'simod_content_approve') {
+    // If no filters applied or 'All' filter is set
+    if (!isset($_GET['type']) || $_GET['type'] == 'All') {
+      // Go through each content type and check if it has moderation enabled if user has the right to administer this content
+      foreach (node_type_get_types() as $type => $info) {
+        if (variable_get('simod_moderate_' . $type, 0) == 1 && user_access('edit any ' . $type . ' content')) {
+          $type_values[] = $type;
+        } 
+      }
+      // $type_values is an array with names of content types which have moderation mode enabled
+      if (isset($type_values)) {
+        // Altering Where condition to select nodes of needed types        
+        $query->where[0]['conditions'][] = array('field' => 'node.type', 'operator' => 'in', 'value' => $type_values);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function simod_form_views_exposed_form_alter(&$form, &$form_state) {
+  if ($form['#id'] == 'views-exposed-form-simod-content-approve-page') {
+    // Set default All filter
+    $options['All'] = '- Any -';
+    // Go through each content type and check if it has moderation enabled and if user has the right to administer this content
+    foreach (node_type_get_types() as $type => $info) {
+      if (variable_get('simod_moderate_' . $type, 0) == 1 && user_access('edit any ' . $type . ' content')) {
+        $options[$type] = $info->name;
+      } 
+    }
+    // Check if we have some content_types enabled
+    if (count($options) > 1) {
+      // Add new options
+      $form['type']['#options'] = $options;
+    } 
+    else {
+      // Hide exposed form
+      $form['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Registering Views API
+ */
+function simod_views_api() {
+  return array(
+    'api' => 3,
+  );
+}
+
+/**
+ * Implements hook_mail().
+ */
+function simod_mail($key, &$message, $params) {
+  // Load default email templates
+  $email_templates = simod_email_templates();
+  
+  switch ($key) {
+   case 'thankyou':
+   case 'newcontent':
+   case 'approved':
+   case 'disapproved':
+    // Replace text with tokens
+    $title = token_replace(variable_get('simod_mail_' . $key . '_title', $email_templates[$key]['#default_template']['title']), $params);
+    $text = token_replace(variable_get('simod_mail_' . $key . '_message', $email_templates[$key]['#default_template']['title']), $params);
+    break;
+  }
+  
+  $langcode = $message['language']->language;
+  $message['subject'] = t($title, array('langcode' => $langcode));
+  $message['body'][] = t($text, array('langcode' => $langcode));
+  if (isset($params['bcc'])) {
+    $message['headers']['Bcc'] = $params['bcc'];
+  }
+}
+
+/**
+ * This function holds all possible types of email templates and its default values
+ */
+function simod_email_templates() {
+  return array(
+    'newcontent' => array(
+      '#description' => 'Administrator gets this message when moderated content has been submited',
+      '#default_template' => array(
+        'title' => 'New [node:content-type:name] added to the site',
+        'message' => 'New [node:content-type:name] added to the site. Moderation link: [site:url][node:url:path]/edit',
+      ),
+    ),  
+    'thankyou' => array(
+      '#description' => 'User gets this message after he submited content',
+      '#default_template' => array(
+        'title' => 'The [node:content-type:name] has been submitted for approval',
+        'message' => 'Thank you for submitting the [node:content-type:name]. We will review it shortly.',
+      ),
+    ), 
+    'approved' => array(
+      '#description' => 'User gets this message when his content has been approved',
+      '#default_template' => array(
+        'title' => 'Your [node:content-type:name] has been approved',
+        'message' => 'Your [node:content-type:name]: [node:title] has been approved and published on the site',
+      ),
+    ), 
+    'disapproved' => array(
+      '#description' => 'User gets this message when his content has been disapproved and deleted',
+      '#default_template' => array(
+        'title' => 'Your [node:content-type:name] has been disapproved and deleted',
+        'message' => 'Your [node:content-type:name]: [node:title] has been disapproved and deleted. [simod:disapproved-message]',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_token_info().
+ */
+function simod_token_info() {
+  // Add two different token types. The first is the generic text format. The
+  // second is the user's default text format, which is itself a 'format' token
+  // type so it can be used directly.
+  $info['types']['simod'] = array(
+    'name' => t('Simple Moderation'),
+    'description' => t('Tokens related to simple moderation'),
+    'needs-data' => 'format',
+  );
+
+  // Tokens for the text format token type.
+  $info['tokens']['simod']['disapproved-message'] = array(
+    'name' => t('Disapprove reason'),
+    'description' => t("The reason why the content has been disapproved."),
+  );
+
+  return $info;
+}
+
+function simod_tokens($type, $tokens, array $data = array(), array $options = array()) {
+  $replacements = array();
+
+  // Node tokens.
+  if ($type == 'simod' && !empty($data['simod'])) {
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'disapproved-message':
+          $replacements[$original] = $data['simod']['disapproved-message'];
+          break;
+      }
+    }
+  }
+  
+  return $replacements;
+}
+
+/**
+ * Helper function to get admin emails
+ */
+function _simod_admin_emails() {
+  return variable_get('simod_admin_email', variable_get('site_mail', ''));
+}

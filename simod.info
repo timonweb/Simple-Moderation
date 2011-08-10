@@ -1,0 +1,7 @@
+name = Simple Moderation
+description = Provides simple moderation workflow
+core = 7.x
+version = 7.0
+package = CME
+dependencies[] = views_bulk_operations
+dependencies[] = token

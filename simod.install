@@ -1,0 +1,66 @@
+<?php
+// $Id$
+
+require_once 'simod.module';
+
+/**
+ * @file
+ * Install, update and uninstall functions for the simod module.
+ */
+
+/**
+ * Implementation of hook_schema().
+ */
+function simod_schema() {
+  $schema['simod_anonymous_submissions'] = array(
+    'description' => 'TODO: please describe this table!',
+    'fields' => array(
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'mail' => array(
+        'type' => 'varchar',
+        'length' => '64',
+        'not null' => FALSE,
+      ),
+      'hostname' => array(
+        'type' => 'varchar',
+        'length' => '128',
+        'not null' => TRUE,
+      ),
+      'created' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'indexes' => array(
+      'nid' => array('nid'),
+    ),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function simod_uninstall() {
+  // Clear content type specific variables
+  foreach (node_type_get_types() as $type => $info) {
+    variable_del('simod_moderate_' . $type);
+  }
+  
+  // Clear admin emails
+  variable_del('simod_admin_email');
+  
+  // Clear email templates
+  $email_templates = simod_email_templates();
+  foreach ($email_templates AS $type => $info) {
+    variable_del('simod_mail_' . $type . '_title');
+    variable_del('simod_mail_' . $type . '_message');
+  }
+}
